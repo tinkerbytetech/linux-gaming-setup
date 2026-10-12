@@ -1,5 +1,23 @@
 # TinkerByteTech Gaming Setup
 
+## Quick start
+
+1. **Download the ZIP for your distro:** [Debian](tinkerbytetech-debian-gaming-setup-terminal.zip) · [Ubuntu](tinkerbytetech-ubuntu-gaming-setup-terminal.zip) · [Kubuntu](tinkerbytetech-kubuntu-gaming-setup-terminal.zip) · [Fedora](tinkerbytetech-fedora-gaming-setup-terminal.zip). On the file page, click **Download raw file** (the download arrow).
+2. **Extract the ZIP.** Open the extracted folder, right-click an empty area, and choose **Open in Terminal**.
+3. **Start the installer.** For Ubuntu, enter:
+   ```sh
+   python3 tinkerbytetech-ubuntu-gaming-setup-terminal.py
+   ```
+   For another distro, replace `ubuntu` with `debian`, `kubuntu`, or `fedora`. Run it as your normal user—do not put `sudo` before this command.
+4. **Choose your tools.** Enter `1 2 3 5` for **Steam, Lutris, Faugus Launcher, and Wine**, then press Enter. The menu also lets you choose a different combination.
+5. **Review the setup**, then type **I** and press Enter to install. Enter your password in the terminal if requested. To see a preview first, choose **P**; choose **Q** to quit.
+
+When installation finishes, open your installed apps from your desktop’s application menu.
+
+Prefer a graphical interface? Use the **Graphical installer** links in [Downloads](#downloads) below.
+
+---
+
 The main method is an interactive terminal installer, with an optional browser-based graphical edition.
 
 Four original standalone terminal downloads:
