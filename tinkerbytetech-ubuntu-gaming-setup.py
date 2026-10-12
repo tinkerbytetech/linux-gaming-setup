@@ -5,6 +5,10 @@ import argparse
 import hashlib
 import json
 import os
+import re
+import tempfile
+from urllib.request import Request, urlopen
+from urllib.parse import urlparse
 from pathlib import Path
 import platform
 import secrets
@@ -17,7 +21,7 @@ import webbrowser
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 TARGET = 'ubuntu'
-VERSION = '0.1.0'
+VERSION = '0.2.0'
 DISTROS = {'debian': 'Debian', 'ubuntu': 'Ubuntu', 'kubuntu': 'Kubuntu', 'fedora': 'Fedora'}
 APPS = {
     'steam': ('Steam', 'com.valvesoftware.Steam', 'Your Steam library and Proton games'),
@@ -61,49 +65,116 @@ def validate_choices(values):
     return list(dict.fromkeys(values))
 
 
-def build_plan(target, values):
+# Fixed upstream release assets. Hashes prevent changed downloads from being installed.
+ASSETS = {
+    'steam': ('https://cdn.akamai.steamstatic.com/client/installer/steam.deb', '765aba9a0ed339a50226ceb614fcc9879a991ba184098bc8de920efb12c714a4'),
+    'lutris': ('https://github.com/lutris/lutris/releases/download/v0.5.22/lutris_0.5.22_all.deb', '88a350357e0438b423cdf93108f27942de094dc19f973df73839f3b0b0bafaa0'),
+    'faugus': ('https://github.com/Faugus/faugus-launcher/releases/download/2.4.4/faugus-launcher_2.4.4-1_all.deb', '90db827814951d9878c80db6bdfee06097c3a593d5d6f7aee2d15b66382940ce'),
+    'protonup': ('https://github.com/DavidoTek/ProtonUp-Qt/releases/download/v2.16.0/ProtonUp-Qt-2.16.0-x86_64.AppImage', '862a717502f0b9601f23e849a4b4dfe3d69aed7e7ca262cf1bdc4a553f8de7ec'),
+}
+NATIVE_PACKAGES = {'steam': ['steam', 'steam-launcher', 'steam-installer'], 'lutris': ['lutris'], 'faugus': ['faugus-launcher'], 'protonup': ['protonup-qt']}
+
+
+def validate_mode(mode):
+    if mode not in ('native', 'flatpak'):
+        raise ValueError('Choose Native or Flatpak installation.')
+    return mode
+
+
+def existing_apps(target):
+    result = {}
+    for key, (_, app, _) in APPS.items():
+        binary = shutil.which(NATIVE_PACKAGES[key][0])
+        found = bool(binary)
+        for package in NATIVE_PACKAGES[key]:
+            if target == 'fedora':
+                argv = ['rpm', '-q', package]
+            else:
+                argv = ['dpkg-query', '-W', '-f=${Status}', package]
+            if shutil.which(argv[0]):
+                check = subprocess.run(argv, capture_output=True, text=True, timeout=15)
+                found = found or (check.returncode == 0 and (target == 'fedora' or 'install ok installed' in check.stdout))
+        if key == 'protonup' and (Path.home()/'.local/share/tinkerbytetech/protonup-qt/ProtonUp-Qt.AppImage').is_file():
+            found = True
+        if found:
+            result[key] = 'native'
+            continue
+        if shutil.which('flatpak'):
+            for scope in ('--user', '--system'):
+                check = subprocess.run(['flatpak', scope, 'info', app], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=15)
+                if check.returncode == 0:
+                    result[key] = 'Flatpak '+scope[2:]
+                    break
+    return result
+
+
+def build_plan(target, values, mode='native', existing=None):
+    validate_mode(mode)
     choices = validate_choices(values)
-    apps = [v for v in choices if v in APPS]
+    existing = existing or {}
+    apps = [v for v in choices if v in APPS and v not in existing]
     native = [v for v in choices if v in NATIVE]
-    packages = (['flatpak'] if apps else []) + [v for v in native if v != 'wine']
-    if 'wine' in native:
-        packages += ['wine'] if target == 'fedora' else ['wine', 'wine64', 'wine32:i386']
+    packages = [v for v in native if v != 'wine']
     steps = []
-    def step(title, argv, admin=False, app=None):
-        steps.append({'title': title, 'argv': argv, 'admin': admin, 'app': app})
-    if target == 'fedora':
-        step('Install selected system packages', ['dnf', '-y', 'install'] + packages, True)
-    else:
-        if 'wine' in native:
-            step('Enable 32-bit package support for Wine', ['dpkg', '--add-architecture', 'i386'], True)
-        step('Refresh package lists', ['apt-get', 'update'], True)
-        step('Install selected system packages', ['apt-get', '-y', 'install'] + packages, True)
-    if apps:
+    def step(title, argv, admin=False, app=None, **extra):
+        steps.append(dict(title=title, argv=argv, admin=admin, app=app, **extra))
+    for key in choices:
+        if key in APPS and key in existing:
+            step('Keep '+APPS[key][0]+' ('+existing[key]+')', ['Keep existing installation', APPS[key][0]], action='keep')
+    needs_wine = 'wine' in native or (mode == 'native' and 'lutris' in apps)
+    if needs_wine:
+        packages += ['wine'] if target == 'fedora' else ['wine', 'wine64', 'wine32:i386']
+    if mode == 'flatpak' and apps:
+        packages += ['flatpak']
+    if mode == 'native' and target == 'fedora':
+        packages += [NATIVE_PACKAGES[k][0] for k in apps if k != 'protonup']
+        if 'faugus' in apps:
+            step('Install DNF Copr support', ['dnf', '-y', 'install', 'dnf-plugins-core'], True)
+            step('Enable Faugus project Copr repository', ['dnf', '-y', 'copr', 'enable', 'faugus/faugus-launcher'], True)
+        if 'steam' in apps:
+            step('Enable RPM Fusion free and nonfree repositories for Steam (matching this Fedora release)', ['dnf', '-y', 'install', 'https://download1.rpmfusion.org/free/fedora/rpmfusion-free-release-{fedora-version}.noarch.rpm', 'https://download1.rpmfusion.org/nonfree/fedora/rpmfusion-nonfree-release-{fedora-version}.noarch.rpm'], True, action='rpmfusion')
+    if target != 'fedora':
+        if needs_wine or (mode == 'native' and any(k in apps for k in ('steam', 'faugus'))):
+            step('Enable 32-bit package support', ['dpkg', '--add-architecture', 'i386'], True)
+        if packages or (mode == 'native' and any(k in apps for k in ('steam', 'lutris', 'faugus'))):
+            step('Refresh package lists', ['apt-get', 'update'], True)
+    if packages:
+        step('Install selected system packages and required dependencies', (['dnf', '-y', 'install'] if target == 'fedora' else ['apt-get', '-y', 'install'])+list(dict.fromkeys(packages)), True)
+    if mode == 'flatpak' and apps:
         step('Add Flathub for your user account', ['flatpak', '--user', 'remote-add', '--if-not-exists', 'flathub', FLATHUB])
         for key in apps:
-            name, app_id, _ = APPS[key]
-            step(f'Install {name}', ['flatpak', '--user', 'install', '--noninteractive', '-y', 'flathub', app_id], app=app_id)
+            name, app, _ = APPS[key]
+            step('Install '+name+' (Flatpak)', ['flatpak', '--user', 'install', '--noninteractive', '-y', 'flathub', app], app=app)
+        if 'mangohud' in native:
+            step('Install MangoHud layers matching the selected Flatpak runtimes', ['flatpak', '--user', 'install', 'matching org.freedesktop.Platform.VulkanLayer.MangoHud branches'], action='flatpak-mangohud', apps=[k for k in apps if k != 'protonup'])
+    elif mode == 'native':
+        for key in apps:
+            if key != 'protonup' and target == 'fedora':
+                continue
+            url, digest = ASSETS[key]
+            name = APPS[key][0]
+            step('Install '+name+(' (upstream AppImage, application-menu shortcut)' if key == 'protonup' else ' (upstream .deb)'), ['Download', url, 'SHA256', digest, 'then install as '+('user AppImage' if key == 'protonup' else 'native package')], action='asset', key=key)
     return steps
 
 
-def plan_id(choices, steps):
-    return hashlib.sha256(json.dumps([choices, steps], sort_keys=True).encode()).hexdigest()
+def plan_id(choices, steps, mode='native'):
+    return hashlib.sha256(json.dumps([validate_mode(mode), choices, steps], sort_keys=True).encode()).hexdigest()
 
 
 PAGE = r'''<!doctype html><html lang="en"><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>TinkerByteTech Gaming Setup</title>
 <style nonce="__NONCE__">
 :root{color-scheme:dark;font-family:system-ui,sans-serif;color:#e9f4ed;background:#06100b}*{box-sizing:border-box}body{margin:0}main{max-width:1050px;margin:35px auto;padding:0 24px}.brand{color:#59ed80;font-size:22px;font-weight:750;letter-spacing:-.6px}.brand small{font-size:12px;font-weight:400;color:#94b29f;margin-left:12px}h1{font-size:38px;letter-spacing:-1px;margin:28px 0 10px}p{color:#abc2b3;line-height:1.65}.badge{display:inline-block;border:1px solid #355a43;padding:5px 12px;border-radius:20px;font-size:12px;color:#a2edb5}.layout{display:grid;grid-template-columns:1.1fr 1fr;gap:22px;margin-top:25px}.panel{background:#0c1b12;border:1px solid #294d36;border-radius:16px;padding:22px}h2{font-size:18px;margin:0 0 17px}.option{display:flex;gap:12px;align-items:center;padding:14px 0;border-bottom:1px solid #223a2a;cursor:pointer}.option:last-child{border:0}.option input{accent-color:#4cde73;width:18px;height:18px;flex-shrink:0}.option b{font-size:14px}.option small{display:block;color:#8eaa98;font-size:12px;margin-top:4px}.option:has(input:checked) b{color:#91f3ad}button{font:600 13px system-ui;cursor:pointer;padding:12px 18px;border-radius:9px;background:#183c26;border:1px solid #497c58;color:#daf7e3}button:hover{border-color:#74dc8c}button:disabled{opacity:.45;cursor:default}.primary{background:#49de70;color:#05210e;border-color:#65ee8a}.actions{display:flex;gap:10px;flex-wrap:wrap;margin:20px 0 0}pre{background:#06110a;border:1px solid #233e2c;border-radius:9px;padding:14px;font:12px/1.65 monospace;white-space:pre-wrap;overflow-wrap:anywhere;color:#b7dbc4;max-height:310px;overflow:auto}.status{padding:11px 13px;background:#07150b;border-radius:8px;color:#9adcae;font-size:13px;line-height:1.5;margin-bottom:16px}.status.error{color:#ffc1ac;border:1px solid #924e3b}.check{display:flex;gap:8px;align-items:center;margin-top:17px;font-size:13px;color:#abc2b3}.check input{accent-color:#4cde73}.hint{font-size:12px}progress{width:100%;height:8px;accent-color:#49de70;margin-top:14px}#plan{max-height:270px;overflow:auto}a{color:#91f3ad}:focus-visible{outline:2px solid #87ff9f;outline-offset:4px}@media(max-width:740px){main{padding:0 16px}.layout{grid-template-columns:1fr}h1{font-size:29px}.brand small{display:block;margin-left:0;margin-top:5px}}
-</style><main><div class="brand">TinkerByteTech <small>Gaming Setup</small></div><h1 id="title">Set up your gaming tools</h1><span class="badge" id="distro">Detecting system…</span><p>Pick the tools you want. Review the setup, then install them together.</p><div class="layout"><section class="panel"><h2>Choose your tools</h2><div id="choices"></div><label class="check"><input id="dry" type="checkbox" checked>Preview only — show steps without installing</label><div class="actions"><button id="review">Review setup</button><button id="start" class="primary" disabled>Start setup</button></div><p class="hint">App downloads use Flathub. System packages use your distribution’s repositories. Your desktop may ask for administrator authentication.</p></section><section class="panel"><h2>Your setup</h2><div class="status" id="status" role="status">Ready to choose your tools.</div><div id="plan"></div><progress id="progress" max="100" value="0"></progress><pre id="output" aria-label="Setup progress">Progress will appear here.</pre><div class="actions"><button id="save" disabled>Save log</button><button id="close">Close installer</button></div></section></div></main>
+</style><main><div class="brand">TinkerByteTech <small>Gaming Setup</small></div><h1 id="title">Set up your gaming tools</h1><span class="badge" id="distro">Detecting system…</span><p>Pick the tools you want. Review the setup, then install them together.</p><div class="layout"><section class="panel"><h2>Choose your tools</h2><label class="check">Install launchers as <select id="mode" style="background:#06110a;color:#daf7e3;border:1px solid #497c58;border-radius:7px;padding:8px"><option value="native">Native (default)</option><option value="flatpak">Flatpak</option></select></label><div id="choices"></div><label class="check"><input id="dry" type="checkbox" checked>Preview only — show steps without installing</label><div class="actions"><button id="review">Review setup</button><button id="start" class="primary" disabled>Start setup</button></div><p class="hint">Native uses distro packages and upstream downloads; optional ProtonUp-Qt uses an AppImage. Flatpak uses Flathub. Repository additions appear in the review. Your desktop may ask for administrator authentication.</p></section><section class="panel"><h2>Your setup</h2><div class="status" id="status" role="status">Ready to choose your tools.</div><div id="plan"></div><progress id="progress" max="100" value="0"></progress><pre id="output" aria-label="Setup progress">Progress will appear here.</pre><div class="actions"><button id="save" disabled>Save log</button><button id="close">Close installer</button></div></section></div></main>
 <script nonce="__NONCE__">
 const token=location.hash.slice(1)||sessionStorage.getItem('tbt-setup-token')||'';sessionStorage.setItem('tbt-setup-token',token);history.replaceState(null,'',location.pathname);let reviewed=null,busy=false,log='',demo=false;const $=id=>document.getElementById(id);
 async function api(path,body){const r=await fetch('/api/'+path,{method:body?'POST':'GET',headers:{'X-Setup-Token':token,'Content-Type':'application/json'},body:body?JSON.stringify(body):undefined});const d=await r.json();if(!r.ok)throw Error(d.error||'Request failed');return d;}
 function values(){return [...document.querySelectorAll('#choices input:checked')].map(n=>n.value)}
 function reset(){reviewed=null;$('start').disabled=true;$('plan').replaceChildren()}
 function message(text,error=false){$('status').textContent=text;$('status').classList.toggle('error',error)}
-function controls(value){busy=value;document.querySelectorAll('#choices input,#review').forEach(n=>n.disabled=value);$('dry').disabled=value||demo;$('start').disabled=value||!reviewed;$('close').disabled=value}
-$('review').onclick=async()=>{try{const d=await api('plan',{choices:values()});reviewed=d;$('plan').replaceChildren();d.steps.forEach(s=>{const p=document.createElement('p');p.className='hint';p.textContent=s.title;const code=document.createElement('pre');code.textContent=(s.admin?'Administrator: ':'')+s.argv.join(' ');$('plan').append(p,code)});$('start').disabled=false;$('start').textContent=$('dry').checked?'Run preview':'Install selected tools';message(d.blocked||'Setup reviewed. Ready to continue.',!!d.blocked);if(d.blocked&&!$('dry').checked)$('start').disabled=true;}catch(e){reset();message(e.message,true)}};
-$('dry').onchange=reset;
-$('start').onclick=async()=>{try{controls(true);await api('start',{choices:values(),plan:reviewed.id,dry_run:$('dry').checked});message($('dry').checked?'Running preview…':'Installing selected tools…');poll()}catch(e){controls(false);message(e.message,true)}};
+function controls(value){busy=value;document.querySelectorAll('#choices input,#review,#mode').forEach(n=>n.disabled=value);$('dry').disabled=value||demo;$('start').disabled=value||!reviewed;$('close').disabled=value}
+$('review').onclick=async()=>{try{const d=await api('plan',{choices:values(),mode:$('mode').value});reviewed=d;$('plan').replaceChildren();d.steps.forEach(s=>{const p=document.createElement('p');p.className='hint';p.textContent=s.title;const code=document.createElement('pre');code.textContent=(s.admin?'Administrator: ':'')+s.argv.join(' ');$('plan').append(p,code)});$('start').disabled=false;$('start').textContent=$('dry').checked?'Run preview':'Install selected tools';message(d.blocked||'Setup reviewed. Ready to continue.',!!d.blocked);if(d.blocked&&!$('dry').checked)$('start').disabled=true;}catch(e){reset();message(e.message,true)}};
+$('dry').onchange=reset;$('mode').onchange=reset;
+$('start').onclick=async()=>{try{controls(true);await api('start',{choices:values(),mode:$('mode').value,plan:reviewed.id,dry_run:$('dry').checked});message($('dry').checked?'Running preview…':'Installing selected tools…');poll()}catch(e){controls(false);message(e.message,true)}};
 async function poll(){try{const d=await api('state');log=d.log.join('\n');$('output').textContent=log||'Starting…';$('output').scrollTop=$('output').scrollHeight;$('progress').value=d.progress;$('save').disabled=!log;if(d.running){setTimeout(poll,700)}else{controls(false);message(d.message,d.failed);reset()}}catch(e){controls(false);message(e.message,true)}}
 $('save').onclick=()=>{const a=document.createElement('a');a.href=URL.createObjectURL(new Blob([log],{type:'text/plain'}));a.download='tinkerbytetech-gaming-setup.log';a.click();setTimeout(()=>URL.revokeObjectURL(a.href),1000)};
 $('close').onclick=async()=>{try{await api('close',{});message('Installer closed. You can close this tab.');document.querySelectorAll('button,input').forEach(n=>n.disabled=true)}catch(e){message(e.message,true)}};
@@ -122,6 +193,7 @@ class Setup:
         self.running, self.failed, self.progress = False, False, 0
         self.message, self.log = 'Ready.', []
         self.origin = ''
+        self.existing = {} if demo else existing_apps(target)
 
     def snapshot(self):
         with self.lock:
@@ -134,6 +206,19 @@ class Setup:
             self.log = self.log[-1200:]
 
     def command(self, step):
+        action = step.get('action')
+        if action == 'keep':
+            self.append(step['title']); return
+        if action == 'asset':
+            return self.install_asset(step['key'])
+        if action == 'flatpak-mangohud':
+            return self.install_flatpak_mangohud(step['apps'])
+        if action == 'rpmfusion':
+            version = self.info.get('VERSION_ID', '')
+            if not re.fullmatch(r'[0-9]+', version):
+                raise RuntimeError('Cannot determine this Fedora release for RPM Fusion.')
+            argv = [v.replace('{fedora-version}', version) for v in step['argv']]
+            return self.command(dict(title=step['title'], argv=argv, admin=True))
         argv = list(step['argv'])
         if step.get('app'):
             flatpak = shutil.which('flatpak', path='/usr/bin:/bin')
@@ -187,6 +272,58 @@ class Setup:
         if code:
             raise RuntimeError(f'{step["title"]} stopped (exit {code}). Details are in the log above.')
 
+    def install_asset(self, key):
+        url, expected = ASSETS[key]
+        cache = Path.home()/'.cache/tinkerbytetech/gaming-setup'
+        cache.mkdir(parents=True, exist_ok=True)
+        with tempfile.TemporaryDirectory(prefix='download-', dir=cache) as folder:
+            path = Path(folder)/url.rsplit('/', 1)[-1]
+            digest = hashlib.sha256()
+            with urlopen(Request(url, headers={'User-Agent': 'TinkerByteTech-Gaming-Setup/'+VERSION}), timeout=60) as response, path.open('wb') as output:
+                destination = urlparse(response.url)
+                if destination.scheme != 'https' or destination.hostname not in ('github.com', 'release-assets.githubusercontent.com', 'objects.githubusercontent.com', 'cdn.akamai.steamstatic.com', 'cdn.fastly.steamstatic.com'):
+                    raise RuntimeError('Unexpected download destination.')
+                total = 0
+                while True:
+                    block = response.read(1024*1024)
+                    if not block: break
+                    total += len(block)
+                    if total > 512*1024*1024: raise RuntimeError('Download exceeds the supported size.')
+                    digest.update(block); output.write(block)
+            if digest.hexdigest() != expected:
+                raise RuntimeError('The upstream download changed or is incomplete. Get an updated TinkerByteTech installer before retrying.')
+            if key == 'protonup':
+                home = Path.home()/'.local/share/tinkerbytetech/protonup-qt'
+                home.mkdir(parents=True, exist_ok=True)
+                app = home/'ProtonUp-Qt.AppImage'
+                shutil.copyfile(path, app); app.chmod(0o755)
+                entries = Path.home()/'.local/share/applications'; entries.mkdir(parents=True, exist_ok=True)
+                # AppImage's documented extract-and-run mode avoids requiring FUSE.
+                escaped = str(app).replace('\\', '\\\\').replace('"', '\\"').replace('`', '\\`').replace('$', '\\$').replace('%', '%%')
+                (entries/'tinkerbytetech-protonup-qt.desktop').write_text('[Desktop Entry]\nType=Application\nName=ProtonUp-Qt\nExec="'+escaped+'" --appimage-extract-and-run\nTerminal=false\nCategories=Game;Utility;\n')
+                self.append('Added ProtonUp-Qt to your application menu.'); return
+            self.command(dict(title='Install '+APPS[key][0], argv=['apt-get', '-y', 'install', str(path)], admin=True))
+
+    def install_flatpak_mangohud(self, apps):
+        branches = set()
+        for key in apps:
+            result = subprocess.run(['flatpak', '--user', 'info', '--show-runtime', APPS[key][1]], capture_output=True, text=True, timeout=30)
+            if result.returncode: continue
+            parts = result.stdout.strip().split('/')
+            if len(parts) != 3: raise RuntimeError('Could not determine Flatpak runtime for MangoHud.')
+            branch = parts[2]
+            if parts[0] != 'org.freedesktop.Platform':
+                # GNOME runtime metadata declares the freedesktop extension version.
+                metadata = subprocess.run(['flatpak', '--user', 'info', '--show-metadata', result.stdout.strip()], capture_output=True, text=True, timeout=30)
+                import configparser
+                config = configparser.ConfigParser(interpolation=None); config.read_string(metadata.stdout)
+                branch = config.get('Extension org.freedesktop.Platform.VulkanLayer', 'version', fallback='') or config.get('Extension org.freedesktop.Platform.VulkanLayer', 'versions', fallback='').split(';')[0]
+            if not re.fullmatch(r'[0-9]+(?:\.[0-9]+)?', branch):
+                raise RuntimeError('Could not determine the MangoHud extension branch for this runtime.')
+            branches.add(branch)
+        for branch in sorted(branches):
+            self.command(dict(title='Install Flatpak MangoHud '+branch, argv=['flatpak', '--user', 'install', '--noninteractive', '-y', 'flathub', 'org.freedesktop.Platform.VulkanLayer.MangoHud/x86_64/'+branch], admin=False))
+
     def run(self, steps, dry):
         try:
             for index, step in enumerate(steps):
@@ -208,11 +345,11 @@ class Setup:
             with self.lock:
                 self.running = False
 
-    def start(self, choices, identity, dry):
+    def start(self, choices, identity, dry, mode="native"):
         if not isinstance(dry, bool):
             raise ValueError('Invalid preview setting.')
-        steps = build_plan(self.target, choices)
-        if identity != plan_id(choices, steps):
+        steps = build_plan(self.target, choices, mode, self.existing)
+        if identity != plan_id(choices, steps, mode):
             raise ValueError('Review the selected setup before starting.')
         dry = dry or self.demo
         if self.blocked and not dry:
@@ -283,11 +420,12 @@ def make_handler(setup):
                     threading.Thread(target=self.server.shutdown, daemon=True).start()
                     return
                 choices = validate_choices(data.get('choices'))
-                steps = build_plan(setup.target, choices)
+                mode = validate_mode(data.get('mode', 'native'))
+                steps = build_plan(setup.target, choices, mode, setup.existing)
                 if self.path == '/api/plan':
-                    return self.send(200, dict(id=plan_id(choices, steps), steps=steps, blocked='' if setup.demo else setup.blocked))
+                    return self.send(200, dict(id=plan_id(choices, steps, mode), steps=steps, blocked='' if setup.demo else setup.blocked))
                 if self.path == '/api/start':
-                    setup.start(choices, data.get('plan'), data.get('dry_run'))
+                    setup.start(choices, data.get('plan'), data.get('dry_run'), mode)
                     return self.send(202, {'started': True})
                 return self.send(404, {'error': 'Not found.'})
             except (ValueError, json.JSONDecodeError) as exc:

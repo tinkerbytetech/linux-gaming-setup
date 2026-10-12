@@ -10,7 +10,8 @@
    ```
    For another distro, replace `ubuntu` with `debian`, `kubuntu`, or `fedora`. Run it as your normal user—do not put `sudo` before this command.
 4. **Choose your tools.** Enter `1 2 3 5` for **Steam, Lutris, Faugus Launcher, and Wine**, then press Enter. The menu also lets you choose a different combination.
-5. **Review the setup**, then type **I** and press Enter to install. Enter your password in the terminal if requested. To see a preview first, choose **P**; choose **Q** to quit.
+5. **Choose Native or Flatpak.** Press Enter for **Native (default)**, or enter **F** for Flatpak.
+6. **Review the setup**, then type **I** and press Enter to install. Enter your password in the terminal if requested. To see a preview first, choose **P**; choose **Q** to quit.
 
 When installation finishes, open your installed apps from your desktop’s application menu.
 
@@ -18,7 +19,7 @@ Prefer a graphical interface? Use the **Graphical installer** links in [Download
 
 ---
 
-The main method is an interactive terminal installer, with an optional browser-based graphical edition.
+The main method is an interactive terminal installer, with an optional browser-based graphical edition. Native launcher installation is the default; Flatpak is optional.
 
 Four original standalone terminal downloads:
 
@@ -46,7 +47,7 @@ The source, interface, command planner, HTTP protocol, and tests were written fo
 python3 tinkerbytetech-ubuntu-gaming-setup-terminal.py
 ```
 
-Enter `1 2 3 5` to select Steam, Lutris, Faugus Launcher and Wine. The setup summary lists the commands before any package operation. Choose `I` to install, `P` to preview, or `Q` to quit. Preview is the default. System steps request sudo authentication through the terminal. Run as your regular user so Flatpak apps belong to that account. Installation logs are saved under `~/.local/state/tinkerbytetech/gaming-setup/`.
+Enter `1 2 3 5` to select Steam, Lutris, Faugus Launcher and Wine. Choose **N** for Native (the default), or **F** for Flatpak. The setup summary lists the commands and any repository additions before any package operation. Choose `I` to install, `P` to preview, or `Q` to quit. Preview is the default. System steps request sudo authentication through the terminal. Run as your regular user so Flatpak apps belong to that account. Installation logs are saved under `~/.local/state/tinkerbytetech/gaming-setup/`.
 
 ```sh
 python3 tinkerbytetech-ubuntu-gaming-setup-terminal.py --dry-run --select steam,lutris,faugus,wine
@@ -70,15 +71,25 @@ Demo mode permits reviewing any distro download on another system and always sim
 
 ## Tools and installation routes
 
-- Steam, Lutris, Faugus Launcher and optional ProtonUp-Qt: Flathub, installed per user.
-- Optional Wine: distribution packages; Debian/Ubuntu/Kubuntu enable i386 and install wine, wine64 and wine32:i386. Fedora installs its wine package.
-- Optional GameMode and MangoHud: distribution packages.
-- Existing user or system Flatpak app installs are retained.
-- An existing user remote named flathub with an unrelated URL is rejected.
-- Driver installation, kernel changes, sysctl tuning, game files, game-account sign-ins and Steam compatibility preferences are not changed by this version. Users configure the selected apps after opening them.
-- Fedora Atomic editions are excluded from real installation because they use a different system package workflow. Non-x86-64 systems and unrelated distro IDs are blocked.
-- APT repositories must already provide the selected distribution packages. The installer reports package-manager failures instead of rewriting repository files or choosing a different release's packages.
-- Broad Flatpak filesystem/session-bus overrides are not applied automatically.
+| Tool | Native on Debian / Ubuntu / Kubuntu | Native on Fedora | Flatpak mode |
+| --- | --- | --- | --- |
+| Steam | Valve's upstream `.deb` | RPM Fusion `steam` | Flathub |
+| Lutris | Upstream `.deb`, with native Wine dependencies | Fedora `lutris`, with Wine | Flathub |
+| Faugus Launcher | Upstream `.deb` | Project Copr `faugus/faugus-launcher` | Flathub |
+| ProtonUp-Qt | Upstream AppImage with menu shortcut | Upstream AppImage with menu shortcut | Flathub |
+| Wine | `wine`, `wine64`, `wine32:i386` | `wine` | Same native packages |
+| GameMode / MangoHud | Distro packages | Distro packages | Distro packages; matching MangoHud Flatpak extensions are added for newly installed gaming launchers |
+
+- Native is the default. The terminal supports `--mode native` and `--mode flatpak`.
+- Existing native and Flatpak launchers are retained, without installing a second copy in the selected format.
+- Fedora native Steam adds RPM Fusion free/nonfree repositories matching the detected release. Native Faugus enables the project's Copr. Repository additions appear in the review before installation.
+- Upstream downloads are pinned and SHA256-checked. If an upstream asset changes, setup stops and asks for an updated installer.
+- Native Lutris includes Wine dependencies. Debian/Ubuntu/Kubuntu enable i386 for native Steam, Faugus or Wine.
+- ProtonUp-Qt's AppImage is installed in `~/.local/share/tinkerbytetech/protonup-qt/` with an application-menu shortcut. It uses extract-and-run mode, without requiring FUSE.
+- Flatpak apps are installed per user. An unrelated existing Flathub remote is rejected.
+- GameMode and MangoHud still need enabling in your launcher; this installer does not add game launch options automatically.
+- GPU drivers, kernel settings, game files and account sign-ins are configured separately. Broad Flatpak permission overrides are not applied automatically.
+- Conventional x86-64 distro installations are supported; Fedora Atomic editions use a different package workflow.
 
 ## Development checks
 
